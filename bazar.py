@@ -28,6 +28,7 @@ except locale.Error:
 current_user = {"usuario": None, "rol": None}
 TIEMPO_INACTIVIDAD = 600000 
 temporizador_id = None
+TASA_IVA = 0.19 # Tasa del 19% para el IVA
 
 # ==============================================================================
 # 3. FUNCIONES DE UTILIDAD Y BASE DE DATOS
@@ -56,7 +57,33 @@ def iniciar_bd():
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS usuarios (id INT AUTO_INCREMENT PRIMARY KEY, usuario VARCHAR(50) UNIQUE NOT NULL, clave VARCHAR(255) NOT NULL, rol ENUM('vendedor', 'admin') NOT NULL)")
     cursor.execute("CREATE TABLE IF NOT EXISTS productos (id INT AUTO_INCREMENT PRIMARY KEY, codigo VARCHAR(20) UNIQUE, nombre VARCHAR(100) UNIQUE NOT NULL, precio DECIMAL(10,2) NOT NULL, stock INT NOT NULL, estado ENUM('activo', 'inactivo') NOT NULL DEFAULT 'activo')")
-    cursor.execute("CREATE TABLE IF NOT EXISTS ventas (id INT AUTO_INCREMENT PRIMARY KEY, producto_id INT NOT NULL, cantidad INT NOT NULL, total DECIMAL(10,2) NOT NULL, fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP, vendedor_usuario VARCHAR(50), FOREIGN KEY (producto_id) REFERENCES productos(id))")
+    
+    # ESTRUCTURA DE BOLETAS MODIFICADA PARA INCLUIR IVA
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS boletas (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            vendedor_usuario VARCHAR(50),
+            neto DECIMAL(10,2) NOT NULL,
+            iva DECIMAL(10,2) NOT NULL,
+            total_boleta DECIMAL(10,2) NOT NULL,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tipo_documento ENUM('Boleta', 'Factura') NOT NULL DEFAULT 'Boleta',
+            cliente_rut VARCHAR(12),
+            cliente_nombre VARCHAR(100)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detalle_ventas (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            boleta_id INT NOT NULL,
+            producto_id INT NOT NULL,
+            cantidad INT NOT NULL,
+            precio_unitario DECIMAL(10,2) NOT NULL,
+            subtotal DECIMAL(10,2) NOT NULL,
+            FOREIGN KEY (boleta_id) REFERENCES boletas(id) ON DELETE CASCADE,
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
+        )
+    """)
     
     cursor.execute("SHOW COLUMNS FROM productos LIKE 'estado'");
     if not cursor.fetchone(): cursor.execute("ALTER TABLE productos ADD COLUMN estado ENUM('activo', 'inactivo') NOT NULL DEFAULT 'activo'")
@@ -67,7 +94,7 @@ def iniciar_bd():
     cursor.execute("SELECT id, nombre FROM productos WHERE codigo IS NULL OR codigo = ''")
     productos_sin_codigo = cursor.fetchall()
     if productos_sin_codigo:
-        print(f"Encontrados {len(productos_sin_codigo)} productos sin código. Asignando ahora...")
+        print(f"Asignando códigos a {len(productos_sin_codigo)} productos existentes...")
         for prod_id, prod_nombre in productos_sin_codigo:
             codigo_unico_encontrado = False
             while not codigo_unico_encontrado:
@@ -76,7 +103,6 @@ def iniciar_bd():
                 if cursor.fetchone() is None:
                     cursor.execute("UPDATE productos SET codigo = %s WHERE id = %s", (nuevo_codigo, prod_id))
                     codigo_unico_encontrado = True
-        print("Códigos asignados.")
     
     cursor.execute("SELECT * FROM usuarios WHERE usuario = 'admin'")
     if cursor.fetchone() is None:
@@ -132,7 +158,7 @@ def detener_temporizador_inactividad():
 
 def mostrar_vista(nombre_vista, **kwargs):
     limpiar_frame(content_frame)
-    vistas = {"login": mostrar_vista_login, "dashboard": mostrar_vista_dashboard, "productos": mostrar_vista_productos, "formulario_producto": mostrar_vista_formulario_producto, "usuarios": mostrar_vista_usuarios, "venta": mostrar_vista_venta, "historial": mostrar_vista_historial, "detalle_venta": mostrar_vista_detalle_venta}
+    vistas = {"login": mostrar_vista_login, "dashboard": mostrar_vista_dashboard, "productos": mostrar_vista_productos, "formulario_producto": mostrar_vista_formulario_producto, "usuarios": mostrar_vista_usuarios, "venta": mostrar_vista_venta, "historial": mostrar_vista_historial, "detalle_boleta": mostrar_vista_detalle_boleta}
     funcion_vista = vistas.get(nombre_vista)
     if funcion_vista: funcion_vista(content_frame, **kwargs)
 
@@ -194,18 +220,15 @@ def mostrar_vista_dashboard(frame, **kwargs):
 def mostrar_vista_productos(frame, **kwargs):
     root.geometry("1000x600"); frame.pack(pady=20, padx=20, fill="both", expand=True); _crear_header(frame, "Gestión de Productos", "dashboard")
     producto_seleccionado_actual = {"id": None}
-    
     if current_user['rol'] == 'admin':
         actions_frame = ctk.CTkFrame(master=frame); actions_frame.pack(fill="x", pady=10)
         ctk.CTkButton(master=actions_frame, text="Agregar Nuevo Producto", command=lambda: mostrar_vista("formulario_producto", modo="agregar")).pack(side="left", padx=10)
         btn_editar = ctk.CTkButton(master=actions_frame, text="Editar Producto", state="disabled"); btn_editar.pack(side="left", padx=10)
         btn_archivar = ctk.CTkButton(master=actions_frame, text="Archivar Producto", state="disabled", fg_color="#E67E22", hover_color="#D35400"); btn_archivar.pack(side="left", padx=10)
-    
     tree_frame = ctk.CTkFrame(master=frame); tree_frame.pack(fill="both", expand=True, pady=10)
-    cols = ("Código", "Nombre", "Precio", "Stock"); tree = ttk.Treeview(tree_frame, columns=cols, show='headings', style="Treeview")
+    cols = ("Código", "Nombre", "Precio Neto", "Stock"); tree = ttk.Treeview(tree_frame, columns=cols, show='headings', style="Treeview")
     for col in cols: tree.heading(col, text=col)
-    tree.column("Código", width=100, anchor='center'); tree.column("Nombre", width=300); tree.column("Precio", width=120, anchor='e'); tree.column("Stock", width=100, anchor='center')
-    
+    tree.column("Código", width=100, anchor='center'); tree.column("Nombre", width=300); tree.column("Precio Neto", width=120, anchor='e'); tree.column("Stock", width=100, anchor='center')
     def cargar_productos():
         for i in tree.get_children(): tree.delete(i)
         conn = conectar_bd();
@@ -215,58 +238,43 @@ def mostrar_vista_productos(frame, **kwargs):
             valores_formateados = (producto[1], producto[2], formatear_a_clp(producto[3]), producto[4]); tree.insert("", "end", values=valores_formateados, iid=producto[0])
         conn.close()
     cargar_productos(); tree.pack(fill='both', expand=True)
-
     if current_user['rol'] == 'admin':
         def on_select(event):
             if tree.selection():
                 producto_seleccionado_actual["id"] = tree.selection()[0]
                 btn_editar.configure(state="normal"); btn_archivar.configure(state="normal")
             else:
-                producto_seleccionado_actual["id"] = None
-                btn_editar.configure(state="disabled"); btn_archivar.configure(state="disabled")
-        
+                producto_seleccionado_actual["id"] = None; btn_editar.configure(state="disabled"); btn_archivar.configure(state="disabled")
         def editar_seleccionado():
-            if producto_seleccionado_actual["id"] is not None:
-                mostrar_vista("formulario_producto", modo="editar", producto_id=producto_seleccionado_actual["id"])
-        
+            if producto_seleccionado_actual["id"] is not None: mostrar_vista("formulario_producto", modo="editar", producto_id=producto_seleccionado_actual["id"])
         def archivar_seleccionado():
             if producto_seleccionado_actual["id"] is not None:
-                conn=conectar_bd(); cursor=conn.cursor()
-                cursor.execute("SELECT nombre FROM productos WHERE id = %s", (producto_seleccionado_actual["id"],)); nombre_prod = cursor.fetchone()[0]; conn.close()
+                conn=conectar_bd(); cursor=conn.cursor(); cursor.execute("SELECT nombre FROM productos WHERE id = %s", (producto_seleccionado_actual["id"],)); nombre_prod = cursor.fetchone()[0]; conn.close()
                 if messagebox.askyesno("Archivar Producto", f"¿Seguro que desea archivar '{nombre_prod}'?"):
-                    conn = conectar_bd(); cursor = conn.cursor()
-                    cursor.execute("UPDATE productos SET estado = 'inactivo' WHERE id=%s", (producto_seleccionado_actual["id"],)); conn.commit(); conn.close()
+                    conn = conectar_bd(); cursor = conn.cursor(); cursor.execute("UPDATE productos SET estado = 'inactivo' WHERE id=%s", (producto_seleccionado_actual["id"],)); conn.commit(); conn.close()
                     cargar_productos(); messagebox.showinfo("Éxito", "Producto archivado.")
-        
         tree.bind("<<TreeviewSelect>>", on_select); btn_editar.configure(command=editar_seleccionado); btn_archivar.configure(command=archivar_seleccionado)
 
 def mostrar_vista_formulario_producto(frame, modo, producto_id=None):
     root.geometry("1100x600"); frame.pack(pady=20, padx=20, fill="both", expand=True); frame.grid_columnconfigure(0, weight=1); frame.grid_columnconfigure(1, weight=2); frame.grid_rowconfigure(0, weight=1)
-    
     form_frame = ctk.CTkFrame(master=frame); form_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10)); titulo = "Agregar Nuevo Producto" if modo == "agregar" else "Editar Producto"; ctk.CTkLabel(master=form_frame, text=titulo, font=("Roboto", 20, "bold")).pack(pady=20)
     ctk.CTkLabel(master=form_frame, text="Código:", font=("Roboto", 14)).pack(anchor="w", padx=20); entry_codigo = ctk.CTkEntry(master=form_frame, height=35, state="disabled", placeholder_text="Se genera automáticamente"); entry_codigo.pack(fill="x", padx=20)
     ctk.CTkLabel(master=form_frame, text="Nombre:").pack(anchor="w", padx=20); entry_nombre = ctk.CTkEntry(master=form_frame, height=35); entry_nombre.pack(fill="x", padx=20)
-    ctk.CTkLabel(master=form_frame, text="Precio (CLP):").pack(anchor="w", padx=20); entry_precio = ctk.CTkEntry(master=form_frame, height=35); entry_precio.pack(fill="x", padx=20)
+    ctk.CTkLabel(master=form_frame, text="Precio Neto (sin IVA):").pack(anchor="w", padx=20); entry_precio = ctk.CTkEntry(master=form_frame, height=35); entry_precio.pack(fill="x", padx=20)
     ctk.CTkLabel(master=form_frame, text="Stock:").pack(anchor="w", padx=20); entry_stock = ctk.CTkEntry(master=form_frame, height=35); entry_stock.pack(fill="x", padx=20)
-
     list_frame = ctk.CTkFrame(master=frame); list_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0)); ctk.CTkLabel(master=list_frame, text="Productos Existentes", font=("Roboto", 16, "bold")).pack(pady=10)
     cols = ("Código", "Nombre"); tree = ttk.Treeview(list_frame, columns=cols, show='headings', style="Treeview", height=15); tree.heading("Código", text="Código"); tree.heading("Nombre", text="Nombre"); tree.column("Código", width=80, anchor="center"); tree.pack(fill="both", expand=True, padx=10, pady=10)
-    
     def cargar_lista_productos():
         for i in tree.get_children(): tree.delete(i)
         conn = conectar_bd(); cursor = conn.cursor(); cursor.execute("SELECT codigo, nombre, id FROM productos WHERE estado = 'activo' ORDER BY nombre ASC");
         for p in cursor.fetchall(): tree.insert("", "end", values=(p[0], p[1]), iid=p[2])
         conn.close()
-        
     cargar_lista_productos()
-    
     def autocompletar_formulario_por_doble_clic(event):
         if not tree.selection(): return
         item_id = tree.selection()[0]
         mostrar_vista("formulario_producto", modo="editar", producto_id=item_id)
-
     tree.bind("<Double-1>", autocompletar_formulario_por_doble_clic)
-    
     def guardar_cambios(modo_guardar, p_id=None):
         nombre, precio_str, stock_str = entry_nombre.get(), entry_precio.get(), entry_stock.get()
         if not all([nombre, precio_str, stock_str]): messagebox.showerror("Error", "Todos los campos son obligatorios."); return
@@ -283,10 +291,8 @@ def mostrar_vista_formulario_producto(frame, modo, producto_id=None):
             if modo_guardar == "editar": mostrar_vista("productos")
         except mysql.connector.Error as err: messagebox.showerror("Error de DB", f"No se pudo guardar: {err}")
         finally: conn.close()
-        
     action_form_frame = ctk.CTkFrame(master=form_frame, fg_color="transparent"); action_form_frame.pack(pady=20, fill="x", padx=20)
     btn_guardar = ctk.CTkButton(master=action_form_frame, text="Guardar Cambios", height=40); btn_guardar.pack(side="left", expand=True, padx=(0,5)); ctk.CTkButton(master=action_form_frame, text="Volver", height=40, fg_color="gray", command=lambda: mostrar_vista("productos")).pack(side="left", expand=True, padx=(5,0))
-    
     if modo == "agregar": btn_guardar.configure(command=lambda: guardar_cambios("agregar"))
     elif modo == "editar" and producto_id:
         conn = conectar_bd(); cursor = conn.cursor(); cursor.execute("SELECT codigo, nombre, precio, stock FROM productos WHERE id=%s", (producto_id,)); data = cursor.fetchone(); conn.close()
@@ -346,127 +352,208 @@ def mostrar_vista_venta(frame, **kwargs):
     root.geometry("1200x700"); frame.pack(pady=20, padx=20, fill="both", expand=True); _crear_header(frame, "Punto de Venta", "dashboard")
     main_content = ctk.CTkFrame(frame, fg_color="transparent"); main_content.pack(fill="both", expand=True); main_content.grid_columnconfigure(0, weight=1); main_content.grid_columnconfigure(1, weight=1); main_content.grid_rowconfigure(0, weight=1)
     carrito = []; conn = conectar_bd(); cursor = conn.cursor(); cursor.execute("SELECT id, nombre, precio, stock FROM productos WHERE stock > 0 AND estado = 'activo'"); productos_disponibles = {f"{p[1]} (Stock: {p[3]})": p for p in cursor.fetchall()}; conn.close()
-    select_frame = ctk.CTkFrame(main_content); select_frame.grid(row=0, column=0, sticky="nsew", padx=(0,10)); ctk.CTkLabel(select_frame, text="Añadir Producto", font=("Roboto", 16, "bold")).pack(pady=10); ctk.CTkLabel(select_frame, text="Producto:").pack(anchor="w", padx=20); combo_productos = ctk.CTkComboBox(select_frame, height=35, values=list(productos_disponibles.keys()), state="readonly"); combo_productos.pack(fill="x", padx=20); ctk.CTkLabel(select_frame, text="Cantidad:").pack(anchor="w", padx=20); entry_cantidad = ctk.CTkEntry(select_frame, height=35); entry_cantidad.pack(fill="x", padx=20)
-    cart_frame = ctk.CTkFrame(main_content); cart_frame.grid(row=0, column=1, sticky="nsew", padx=(10,0)); ctk.CTkLabel(cart_frame, text="Carrito de Compras", font=("Roboto", 16, "bold")).pack(pady=10); cols = ("Producto", "Cant.", "Precio Unit.", "Subtotal"); tree_carrito = ttk.Treeview(cart_frame, columns=cols, show='headings', style="Treeview");
+    
+    select_frame = ctk.CTkFrame(main_content); select_frame.grid(row=0, column=0, sticky="nsew", padx=(0,10))
+    ctk.CTkLabel(select_frame, text="Añadir Producto", font=("Roboto", 16, "bold")).pack(pady=10)
+    ctk.CTkLabel(select_frame, text="Producto:").pack(anchor="w", padx=20); combo_productos = ctk.CTkComboBox(select_frame, height=35, values=list(productos_disponibles.keys()), state="readonly"); combo_productos.pack(fill="x", padx=20)
+    ctk.CTkLabel(select_frame, text="Cantidad:").pack(anchor="w", padx=20); entry_cantidad = ctk.CTkEntry(select_frame, height=35); entry_cantidad.pack(fill="x", padx=20)
+    cart_add_icon = cargar_icono("cart-add.png", size=(20, 20))
+    ctk.CTkButton(select_frame, text="Añadir al Carrito", height=40, image=cart_add_icon, compound="left", command=lambda: anadir_al_carrito()).pack(pady=20, fill="x", padx=20)
+    
+    ctk.CTkLabel(select_frame, text="Tipo de Documento:", font=("Roboto", 16, "bold")).pack(pady=(20, 5), anchor="w", padx=20)
+    tipo_documento_var = tkinter.StringVar(value="Boleta")
+    factura_frame = ctk.CTkFrame(select_frame, fg_color="transparent")
+    def toggle_factura_fields():
+        if tipo_documento_var.get() == "Factura": factura_frame.pack(fill="x", padx=20, pady=5, after=radio_factura)
+        else: factura_frame.pack_forget()
+    radio_boleta = ctk.CTkRadioButton(select_frame, text="Boleta", variable=tipo_documento_var, value="Boleta", command=toggle_factura_fields); radio_boleta.pack(anchor="w", padx=20, pady=5)
+    radio_factura = ctk.CTkRadioButton(select_frame, text="Factura", variable=tipo_documento_var, value="Factura", command=toggle_factura_fields); radio_factura.pack(anchor="w", padx=20, pady=5)
+    entry_rut_cliente = ctk.CTkEntry(factura_frame, placeholder_text="RUT Cliente"); entry_rut_cliente.pack(fill="x", pady=5)
+    entry_nombre_cliente = ctk.CTkEntry(factura_frame, placeholder_text="Nombre o Razón Social"); entry_nombre_cliente.pack(fill="x", pady=5)
+
+    cart_frame = ctk.CTkFrame(main_content); cart_frame.grid(row=0, column=1, sticky="nsew", padx=(10,0)); ctk.CTkLabel(cart_frame, text="Carrito de Compras", font=("Roboto", 16, "bold")).pack(pady=10); cols = ("Producto", "Cant.", "Precio Neto", "Subtotal"); tree_carrito = ttk.Treeview(cart_frame, columns=cols, show='headings', style="Treeview");
     for col in cols: tree_carrito.heading(col, text=col)
-    tree_carrito.column("Cant.", width=60, anchor="center"); tree_carrito.column("Precio Unit.", width=120, anchor="e"); tree_carrito.column("Subtotal", width=120, anchor="e"); tree_carrito.pack(fill="both", expand=True, padx=10, pady=10)
-    total_label = ctk.CTkLabel(cart_frame, text=formatear_a_clp(0), font=("Roboto", 22, "bold")); total_label.pack(pady=10)
+    tree_carrito.column("Cant.", width=60, anchor="center"); tree_carrito.column("Precio Neto", width=120, anchor="e"); tree_carrito.column("Subtotal", width=120, anchor="e"); tree_carrito.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    # Desglose de totales
+    label_neto = ctk.CTkLabel(cart_frame, text="Neto: CLP$ 0", font=("Roboto", 14)); label_neto.pack(anchor="e", padx=10)
+    label_iva = ctk.CTkLabel(cart_frame, text="IVA (19%): CLP$ 0", font=("Roboto", 14)); label_iva.pack(anchor="e", padx=10)
+    total_label = ctk.CTkLabel(cart_frame, text="TOTAL: CLP$ 0", font=("Roboto", 22, "bold")); total_label.pack(anchor="e", padx=10, pady=(5,10))
+    
     def actualizar_vista_carrito():
         for i in tree_carrito.get_children(): tree_carrito.delete(i)
-        total = 0
+        neto = 0
         for item in carrito:
-            valores_formateados = (item['nombre'], item['cantidad'], formatear_a_clp(item['precio']), formatear_a_clp(item['subtotal'])); tree_carrito.insert("", "end", values=valores_formateados); total += item['subtotal']
-        total_label.configure(text=formatear_a_clp(total))
+            valores_formateados = (item['nombre'], item['cantidad'], formatear_a_clp(item['precio']), formatear_a_clp(item['subtotal'])); tree_carrito.insert("", "end", values=valores_formateados); neto += item['subtotal']
+        iva = neto * TASA_IVA
+        total = neto + iva
+        label_neto.configure(text=f"Neto: {formatear_a_clp(neto)}")
+        label_iva.configure(text=f"IVA ({int(TASA_IVA*100)}%): {formatear_a_clp(iva)}")
+        total_label.configure(text=f"TOTAL: {formatear_a_clp(total)}")
+        
     def anadir_al_carrito():
         prod_str, cant_str = combo_productos.get(), entry_cantidad.get()
         if not all([prod_str, cant_str]): return
         try: cantidad = int(cant_str)
         except ValueError: messagebox.showerror("Error", "Cantidad debe ser un número."); return
+        if cantidad <= 0: messagebox.showerror("Error", "Cantidad debe ser positiva."); return
         prod_id, nombre, precio, stock = productos_disponibles[prod_str]; stock_en_carrito = sum(item['cantidad'] for item in carrito if item['id'] == prod_id)
         if cantidad > stock - stock_en_carrito: messagebox.showerror("Stock insuficiente", f"No hay suficiente stock."); return
         item_existente = next((item for item in carrito if item['id'] == prod_id), None); precio_float = float(precio)
         if item_existente: item_existente['cantidad'] += cantidad; item_existente['subtotal'] = item_existente['cantidad'] * precio_float
         else: carrito.append({'id': prod_id, 'nombre': nombre, 'precio': precio_float, 'cantidad': cantidad, 'subtotal': cantidad * precio_float})
         actualizar_vista_carrito(); entry_cantidad.delete(0, 'end')
+    
     def confirmar_venta():
-        if not carrito: return
-        total_venta_str = total_label.cget('text')
-        if not messagebox.askyesno("Confirmar", f"Total: {total_venta_str}. ¿Continuar?"): return
+        if not carrito: messagebox.showwarning("Carrito Vacío", "Debe añadir productos al carrito."); return
+        
+        tipo_doc = tipo_documento_var.get()
+        cliente_rut, cliente_nombre = None, None
+        if tipo_doc == "Factura":
+            cliente_rut, cliente_nombre = entry_rut_cliente.get(), entry_nombre_cliente.get()
+            if not cliente_rut or not cliente_nombre:
+                messagebox.showerror("Datos Faltantes", "Para una factura, debe ingresar el RUT y Nombre del cliente."); return
+
+        neto = sum(item['subtotal'] for item in carrito); iva = neto * TASA_IVA; total_boleta = neto + iva
+        if not messagebox.askyesno("Confirmar", f"Total a pagar: {formatear_a_clp(total_boleta)}. ¿Continuar?"): return
+        
         conn = conectar_bd(); cursor = conn.cursor()
         try:
+            cursor.execute("INSERT INTO boletas (vendedor_usuario, neto, iva, total_boleta, tipo_documento, cliente_rut, cliente_nombre) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                           (current_user['usuario'], neto, iva, total_boleta, tipo_doc, cliente_rut, cliente_nombre))
+            boleta_id = cursor.lastrowid
             for item in carrito:
-                cursor.execute("INSERT INTO ventas (producto_id, cantidad, total, vendedor_usuario) VALUES (%s, %s, %s, %s)", (item['id'], item['cantidad'], item['subtotal'], current_user['usuario']))
+                cursor.execute("INSERT INTO detalle_ventas (boleta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (%s, %s, %s, %s, %s)",
+                               (boleta_id, item['id'], item['cantidad'], item['precio'], item['subtotal']))
                 cursor.execute("UPDATE productos SET stock = stock - %s WHERE id = %s", (item['cantidad'], item['id']))
             conn.commit(); messagebox.showinfo("Éxito", "Venta registrada."); mostrar_vista("dashboard")
         except mysql.connector.Error as err: conn.rollback(); messagebox.showerror("Error de DB", f"No se pudo completar la venta: {err}")
         finally: conn.close()
-    cart_add_icon = cargar_icono("cart-add.png", size=(20, 20))
-    ctk.CTkButton(select_frame, text="Añadir al Carrito", height=40, image=cart_add_icon, compound="left", command=anadir_al_carrito).pack(pady=20, fill="x", padx=20)
+        
     ctk.CTkButton(cart_frame, text="Confirmar Venta", height=40, fg_color="green", command=confirmar_venta).pack(pady=10, fill="x", padx=10)
 
 def mostrar_vista_historial(frame, **kwargs):
     root.geometry("1200x700"); frame.pack(pady=20, padx=20, fill="both", expand=True)
-    titulo = "Historial General de Ventas" if current_user['rol'] == 'admin' else "Mi Historial de Ventas"
-    _crear_header(frame, titulo, "dashboard")
+    titulo_vista = "Historial General de Boletas" if current_user['rol'] == 'admin' else "Mi Historial de Boletas"
+    _crear_header(frame, titulo_vista, "dashboard")
     main_content = ctk.CTkFrame(frame, fg_color="transparent"); main_content.pack(fill="both", expand=True); main_content.grid_columnconfigure(0, weight=2); main_content.grid_columnconfigure(1, weight=1); main_content.grid_rowconfigure(0, weight=1)
+    
     left_frame = ctk.CTkFrame(main_content, fg_color="transparent"); left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10)); filtros_frame = ctk.CTkFrame(master=left_frame); filtros_frame.pack(fill="x", pady=5)
     ctk.CTkLabel(master=filtros_frame, text="Filtros:", font=("Roboto", 16, "bold")).pack(anchor="w", padx=10, pady=(5,0)); ctk.CTkLabel(master=filtros_frame, text="Buscar por Nombre de Producto:").pack(anchor="w", padx=10)
     entry_producto = ctk.CTkEntry(master=filtros_frame, placeholder_text="Ej: bebida, pan..."); entry_producto.pack(fill="x", padx=10, pady=(0,10))
     def buscar(event=None): aplicar_filtros()
     entry_producto.bind("<Return>", buscar); ctk.CTkButton(master=filtros_frame, text="Buscar", command=buscar).pack(padx=10, pady=(0, 10))
+    
     tree_frame = ctk.CTkFrame(left_frame); tree_frame.pack(fill="both", expand=True, pady=5)
-    cols = ("ID Venta", "Fecha", "N° Productos", "Total"); tree = ttk.Treeview(tree_frame, columns=cols, show='headings', style="Treeview")
+    cols = ("ID Boleta", "Fecha", "Tipo", "Total"); tree = ttk.Treeview(tree_frame, columns=cols, show='headings', style="Treeview")
     if current_user['rol'] == 'admin':
         tree.heading("#0", text="Vendedor"); tree.column("#0", width=180)
-    else:
-        tree.column("#0", width=0, stretch=tkinter.NO)
-    tree.heading("ID Venta", text="ID Venta"); tree.heading("Fecha", text="Fecha"); tree.heading("N° Productos", text="N° Prod."); tree.heading("Total", text="Total")
-    tree.column("ID Venta", width=80, anchor="center"); tree.column("Fecha", width=140); tree.column("N° Productos", width=80, anchor="center"); tree.column("Total", anchor="e")
+    else: tree.column("#0", width=0, stretch=tkinter.NO)
+    tree.heading("ID Boleta", text="ID Boleta"); tree.heading("Fecha", text="Fecha"); tree.heading("Tipo", text="Tipo"); tree.heading("Total", text="Total Boleta")
+    tree.column("ID Boleta", width=100, anchor="center"); tree.column("Fecha", width=150); tree.column("Tipo", width=80, anchor="center"); tree.column("Total", anchor="e")
+    
     right_frame = ctk.CTkFrame(main_content); right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0)); ctk.CTkLabel(master=right_frame, text="Acciones", font=("Roboto", 16, "bold")).pack(pady=10)
-    ctk.CTkLabel(master=right_frame, text="Seleccione una venta\npara ver sus detalles.", justify="center", wraplength=250).pack(pady=20, padx=10)
-    btn_ver_detalle = ctk.CTkButton(master=right_frame, text="Ver Detalle de Venta", state="disabled"); btn_ver_detalle.pack(pady=10, padx=20, fill="x")
-    def on_tree_select_for_details(event):
+    ctk.CTkLabel(master=right_frame, text="Seleccione una boleta\n(fila con ID) para ver\nsus detalles completos.", justify="center", wraplength=250).pack(pady=20, padx=10)
+    btn_ver_detalle = ctk.CTkButton(master=right_frame, text="Ver Detalle de Boleta", state="disabled"); btn_ver_detalle.pack(pady=10, padx=20, fill="x")
+    
+    def on_tree_select(event):
         if tree.selection():
             selected_item = tree.selection()[0]
             if tree.parent(selected_item) or current_user['rol'] == 'vendedor': btn_ver_detalle.configure(state="normal")
             else: btn_ver_detalle.configure(state="disabled")
         else: btn_ver_detalle.configure(state="disabled")
+        
     def ver_detalle_seleccionado():
         if tree.selection():
             selected_item = tree.selection()[0]
-            item_values = tree.item(selected_item, "values")
-            if item_values:
-                venta_id = item_values[0]; mostrar_vista("detalle_venta", venta_id=venta_id)
-    tree.bind("<<TreeviewSelect>>", on_tree_select_for_details); btn_ver_detalle.configure(command=ver_detalle_seleccionado); tree.pack(fill='both', expand=True)
+            if tree.parent(selected_item) or current_user['rol'] == 'vendedor':
+                boleta_id = tree.item(selected_item, "values")[0]; mostrar_vista("detalle_boleta", boleta_id=boleta_id)
+
+    tree.bind("<<TreeviewSelect>>", on_tree_select); btn_ver_detalle.configure(command=ver_detalle_seleccionado); tree.pack(fill='both', expand=True)
+
     def aplicar_filtros():
         for i in tree.get_children(): tree.delete(i)
         btn_ver_detalle.configure(state="disabled")
-        query = "SELECT v.id, v.fecha, v.vendedor_usuario, v.cantidad, v.total, p.nombre FROM ventas v JOIN productos p ON v.producto_id = p.id WHERE 1=1"
+        query = "SELECT DISTINCT b.id, b.fecha, b.vendedor_usuario, b.total_boleta, b.tipo_documento FROM boletas b"
         params = []
-        if current_user['rol'] == 'vendedor':
-            query += " AND v.vendedor_usuario = %s"; params.append(current_user['usuario'])
         if entry_producto.get():
-            query += " AND p.nombre LIKE %s"; params.append(f"%{entry_producto.get()}%")
-        query += " GROUP BY v.id ORDER BY v.vendedor_usuario, v.fecha DESC"
+            query = "SELECT DISTINCT b.id, b.fecha, b.vendedor_usuario, b.total_boleta, b.tipo_documento FROM boletas b JOIN detalle_ventas dv ON b.id = dv.boleta_id JOIN productos p ON dv.producto_id = p.id WHERE p.nombre LIKE %s"
+            params.append(f"%{entry_producto.get()}%")
+        if current_user['rol'] == 'vendedor':
+            if 'WHERE' in query: query += " AND b.vendedor_usuario = %s"
+            else: query += " WHERE b.vendedor_usuario = %s"
+            params.append(current_user['usuario'])
+        query += " ORDER BY b.fecha DESC"
+        
         conn = conectar_bd();
         if not conn: return
         cursor = conn.cursor(); cursor.execute(query, tuple(params))
-        ventas = cursor.fetchall(); conn.close()
-        ventas_agrupadas = {}
-        for venta in ventas:
-            vendedor = venta[2] if venta[2] else "Desconocido"
-            if vendedor not in ventas_agrupadas: ventas_agrupadas[vendedor] = []
-            ventas_agrupadas[vendedor].append(venta)
+        boletas = cursor.fetchall(); conn.close()
         
-        for vendedor, ventas_lista in ventas_agrupadas.items():
+        boletas_agrupadas = {}
+        for boleta in boletas:
+            vendedor = boleta[2] if boleta[2] else "Desconocido"
+            if vendedor not in boletas_agrupadas: boletas_agrupadas[vendedor] = []
+            boletas_agrupadas[vendedor].append(boleta)
+            
+        for vendedor, boletas_lista in boletas_agrupadas.items():
             parent_id = ""
             if current_user['rol'] == 'admin':
-                parent_id = tree.insert("", "end", text=f" {vendedor} ({len(ventas_lista)} ventas)", open=True)
-            for venta in ventas_lista:
-                valores_formateados = (venta[0], venta[1].strftime('%d/%m/%Y %H:%M'), venta[3], formatear_a_clp(venta[4])); tree.insert(parent_id, "end", values=valores_formateados)
+                parent_id = tree.insert("", "end", text=f" {vendedor} ({len(boletas_lista)} boletas)", open=True)
+            for boleta in boletas_lista:
+                valores_formateados = (boleta[0], boleta[1].strftime('%d/%m/%Y %H:%M'), boleta[4], formatear_a_clp(boleta[3]))
+                tree.insert(parent_id, "end", values=valores_formateados)
+    
     aplicar_filtros()
 
-def mostrar_vista_detalle_venta(frame, venta_id):
-    root.geometry("800x600"); frame.pack(pady=20, padx=20, fill="both", expand=True); _crear_header(frame, f"Detalle de Venta #{venta_id}", "historial")
-    detalle_frame = ctk.CTkFrame(master=frame); detalle_frame.pack(fill="both", expand=True, padx=20, pady=10)
+def mostrar_vista_detalle_boleta(frame, boleta_id):
+    root.geometry("800x600"); frame.pack(pady=20, padx=20, fill="both", expand=True); _crear_header(frame, f"Detalle de Boleta #{boleta_id}", "historial")
+    main_detalle_frame = ctk.CTkScrollableFrame(master=frame, label_text="", fg_color="transparent"); main_detalle_frame.pack(fill="both", expand=True)
+    detalle_frame = ctk.CTkFrame(master=main_detalle_frame, corner_radius=10); detalle_frame.pack(fill="x", padx=20, pady=10)
+    
     conn = conectar_bd();
     if not conn: return
-    cursor = conn.cursor(); cursor.execute("SELECT v.id, v.fecha, v.vendedor_usuario, p.nombre, v.cantidad, p.precio, v.total, p.codigo FROM ventas v JOIN productos p ON v.producto_id = p.id WHERE v.id = %s", (venta_id,)); data = cursor.fetchone(); conn.close()
-    if not data: ctk.CTkLabel(detalle_frame, text="No se encontraron datos para esta venta.", font=("Roboto", 16)).pack(pady=20); return
-    info_font = ("Roboto", 14); info_font_bold = ("Roboto", 14, "bold")
-    def crear_fila_detalle(parent, label_text, value_text, row):
-        ctk.CTkLabel(parent, text=label_text, font=info_font, anchor="e").grid(row=row, column=0, sticky="ew", padx=10, pady=5)
-        ctk.CTkLabel(parent, text=value_text, font=info_font_bold, anchor="w").grid(row=row, column=1, sticky="ew", padx=10, pady=5)
-    info_frame = ctk.CTkFrame(detalle_frame, fg_color="transparent"); info_frame.pack(pady=20); info_frame.grid_columnconfigure(0, weight=1); info_frame.grid_columnconfigure(1, weight=2)
-    crear_fila_detalle(info_frame, "ID de Venta:", data[0], 0); crear_fila_detalle(info_frame, "Fecha y Hora:", data[1].strftime('%d de %B de %Y, %H:%M:%S'), 1); crear_fila_detalle(info_frame, "Vendido por:", data[2], 2)
-    separator = ctk.CTkFrame(info_frame, height=2, fg_color="gray50"); separator.grid(row=3, columnspan=2, sticky="ew", pady=15, padx=10)
-    crear_fila_detalle(info_frame, "Código Producto:", data[7], 4)
-    crear_fila_detalle(info_frame, "Nombre Producto:", data[3], 5)
-    crear_fila_detalle(info_frame, "Cantidad Vendida:", data[4], 6)
-    crear_fila_detalle(info_frame, "Precio Unitario:", formatear_a_clp(data[5]), 7)
-    separator2 = ctk.CTkFrame(info_frame, height=2, fg_color="gray50"); separator2.grid(row=8, columnspan=2, sticky="ew", pady=15, padx=10)
-    total_label_text = ctk.CTkLabel(info_frame, text="TOTAL VENTA:", font=("Roboto", 18, "bold")); total_label_text.grid(row=9, column=0, sticky="e", padx=10, pady=10)
-    total_label_value = ctk.CTkLabel(info_frame, text=formatear_a_clp(data[6]), font=("Roboto", 18, "bold"), text_color="#2ECC71"); total_label_value.grid(row=9, column=1, sticky="w", padx=10, pady=10)
+    cursor = conn.cursor()
+    cursor.execute("SELECT fecha, vendedor_usuario, neto, iva, total_boleta, tipo_documento, cliente_rut, cliente_nombre FROM boletas WHERE id = %s", (boleta_id,))
+    boleta_data = cursor.fetchone()
+    
+    if not boleta_data:
+        ctk.CTkLabel(detalle_frame, text="No se encontraron datos para esta boleta.", font=("Roboto", 16)).pack(pady=20)
+        conn.close(); return
+        
+    info_grid = ctk.CTkFrame(detalle_frame, fg_color="transparent"); info_grid.pack(pady=20, padx=40, fill="x")
+    info_grid.grid_columnconfigure(0, weight=1); info_grid.grid_columnconfigure(1, weight=2)
+    def crear_fila_detalle(parent, label_text, value_text, row, font_size=14, is_bold=False, value_color=None):
+        label_font = ("Roboto", font_size); value_font = ("Roboto", font_size, "bold") if is_bold else ("Roboto", font_size)
+        ctk.CTkLabel(parent, text=label_text, font=label_font, anchor="e").grid(row=row, column=0, sticky="e", padx=(0, 10), pady=4)
+        ctk.CTkLabel(parent, text=value_text, font=value_font, anchor="w", text_color=value_color).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=4)
+
+    row_idx = 0
+    crear_fila_detalle(info_grid, "Tipo Documento:", boleta_data[5], row_idx); row_idx += 1
+    crear_fila_detalle(info_grid, "ID de Boleta:", boleta_id, row_idx); row_idx += 1
+    crear_fila_detalle(info_grid, "Fecha y Hora:", boleta_data[0].strftime('%d de %B de %Y, %H:%M:%S'), row_idx); row_idx += 1
+    crear_fila_detalle(info_grid, "Vendido por:", boleta_data[1], row_idx); row_idx += 1
+    if boleta_data[5] == 'Factura':
+        crear_fila_detalle(info_grid, "RUT Cliente:", boleta_data[6], row_idx); row_idx += 1
+        crear_fila_detalle(info_grid, "Nombre Cliente:", boleta_data[7], row_idx); row_idx += 1
+
+    ctk.CTkFrame(info_grid, height=2, fg_color="gray50").grid(row=row_idx, columnspan=2, sticky="ew", pady=15); row_idx += 1
+    ctk.CTkLabel(info_grid, text="Productos:", font=("Roboto", 14, "bold")).grid(row=row_idx, columnspan=2, pady=(0,10)); row_idx += 1
+    
+    items_container_frame = ctk.CTkFrame(info_grid, fg_color="transparent"); items_container_frame.grid(row=row_idx, columnspan=2, sticky="ew"); row_idx += 1
+    cursor.execute("SELECT p.codigo, p.nombre, dv.cantidad, dv.precio_unitario, dv.subtotal FROM detalle_ventas dv JOIN productos p ON dv.producto_id = p.id WHERE dv.boleta_id = %s", (boleta_id,))
+    items_vendidos = cursor.fetchall(); conn.close()
+    
+    for item in items_vendidos:
+        item_frame = ctk.CTkFrame(items_container_frame, fg_color=("gray85", "gray22"), corner_radius=6); item_frame.pack(fill="x", pady=5, padx=5, ipady=5)
+        item_grid = ctk.CTkFrame(item_frame, fg_color="transparent"); item_grid.pack(fill="x", padx=10); item_grid.grid_columnconfigure(0, weight=1); item_grid.grid_columnconfigure(1, weight=1)
+        crear_fila_detalle(item_grid, "Código:", item[0], 0, font_size=12); crear_fila_detalle(item_grid, "Producto:", item[1], 1, font_size=12); crear_fila_detalle(item_grid, "Cantidad:", item[2], 2, font_size=12); crear_fila_detalle(item_grid, "P. Unitario (Neto):", formatear_a_clp(item[3]), 3, font_size=12); crear_fila_detalle(item_grid, "Subtotal (Neto):", formatear_a_clp(item[4]), 4, font_size=12, is_bold=True, value_color=("#333", "#ccc"))
+
+    ctk.CTkFrame(info_grid, height=2, fg_color="gray50").grid(row=row_idx, columnspan=2, sticky="ew", pady=15); row_idx += 1
+    crear_fila_detalle(info_grid, "Neto:", formatear_a_clp(boleta_data[2]), row_idx); row_idx += 1
+    crear_fila_detalle(info_grid, f"IVA ({int(TASA_IVA*100)}%):", formatear_a_clp(boleta_data[3]), row_idx); row_idx += 1
+    crear_fila_detalle(info_grid, "TOTAL:", formatear_a_clp(boleta_data[4]), row_idx, font_size=18, is_bold=True, value_color="#2ECC71")
+
 
 # ==============================================================================
 # 6. PUNTO DE ENTRADA PRINCIPAL
